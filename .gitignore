@@ -1,0 +1,15 @@
+/out/
+/startup-fixtures-*/
+*.obj
+*.lib
+*.exp
+*.pdb
+*.exe
+*.dll
+*.log
+*.bmp
+*.dmp
+*.mdmp
+*.tmp
+.vs/
+.vscode/
