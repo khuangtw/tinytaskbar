@@ -1,16 +1,16 @@
-// TinyTaskbar controller, GPL-3.0. Login startup is opt-in and off by default.
-// v3 adds the separate BackgroundStroke brush with independent restoration.
+// SPDX-License-Identifier: GPL-3.0-only
+// Private v4 controller. Native validation is still pending.
 #include "dll_identity.hpp"
 #include "controller_checks.hpp"
 #include "startup.hpp"
+#include "process_checks.hpp"
 #include <shellapi.h>
 #include <psapi.h>
 #include <cstdio>
 #include <cstring>
 #include <memory>
 
-static_assert(sizeof(State)==144 && ProtocolVersion==3,"v3 IPC includes separate border/fill diagnostics.");
-constexpr wchar_t WindowClass[]=L"TinyTaskbar.Manual.2cb3b83d-v3";
+constexpr wchar_t WindowClass[]=L"TinyTaskbar.Controller.4eda63e0-v4";
 constexpr UINT TrayMessage=WM_APP+1;
 static HWND window=nullptr;
 static UINT recreated=0;
@@ -58,17 +58,6 @@ struct Log {
     }
     ~Log(){if(logFile!=INVALID_HANDLE_VALUE){CloseHandle(logFile);logFile=INVALID_HANDLE_VALUE;}}
 };
-static std::vector<unsigned char> user(HANDLE process) {
-    OwnedHandle token;require(OpenProcessToken(process,TOKEN_QUERY,&token.value)!=FALSE,"Cannot read process owner.");DWORD bytes=0;
-    GetTokenInformation(token.value,TokenUser,nullptr,0,&bytes);std::vector<unsigned char> buffer(bytes);
-    require(GetTokenInformation(token.value,TokenUser,buffer.data(),bytes,&bytes)!=FALSE,"Cannot read owner SID.");return buffer;
-}
-static void sameUserSession(HANDLE process) {
-    DWORD pid=GetProcessId(process),ownerSession=0,callerSession=0;
-    require(ProcessIdToSessionId(pid,&ownerSession) && ProcessIdToSessionId(GetCurrentProcessId(),&callerSession) && ownerSession==callerSession,"Process is in another session.");
-    auto owner=user(process),caller=user(GetCurrentProcess());
-    require(EqualSid(reinterpret_cast<TOKEN_USER*>(owner.data())->User.Sid,reinterpret_cast<TOKEN_USER*>(caller.data())->User.Sid)!=FALSE,"Process belongs to another user.");
-}
 static void nonElevated() {
     OwnedHandle token;require(OpenProcessToken(GetCurrentProcess(),TOKEN_QUERY,&token.value)!=FALSE,"Cannot read caller token.");
     TOKEN_ELEVATION elevation={};DWORD bytes=0;
@@ -86,7 +75,8 @@ static DWORD validate(HWND& bar,OwnedHandle& explorer) {
     require(IsWow64Process(explorer.value,&wow) && !wow,"Taskbar architecture differs from this x64 utility.");
     char line[160]={};sprintf_s(line,"Validated Explorer pid=%lu tid=%lu hwnd=%p same-user/session non-elevated",pid,tid,bar);log(line);return tid;
 }
-static std::wstring selectDll(HANDLE explorer,std::wstring executable) {
+struct DllSelection {std::wstring path;bool reconnect=false;};
+static DllSelection selectDll(HANDLE explorer,std::wstring executable) {
     std::vector<HMODULE> modules(512);DWORD bytes=0;
     require(EnumProcessModulesEx(explorer,modules.data(),DWORD(modules.size()*sizeof(HMODULE)),&bytes,LIST_MODULES_64BIT)!=FALSE,"Cannot inspect this Explorer's loaded DLLs.");
     if(bytes>modules.size()*sizeof(HMODULE)) {
@@ -97,85 +87,17 @@ static std::wstring selectDll(HANDLE explorer,std::wstring executable) {
     for(auto module:modules) {
         wchar_t name[MAX_PATH]={};if(!GetModuleBaseNameW(explorer,module,name,MAX_PATH))continue;
         auto classification=classifyDll(name);if(classification==DllGate::Unrelated)continue;
-        require(classification==DllGate::Current,"An older TinyTaskbar DLL is pinned in Explorer. Wait for Explorer to exit naturally or obtain approval for a restart; no second version will be loaded.");
+        require(classification==DllGate::Current,"An older/different TinyTaskbar or TranslucentTB diagnostics DLL is loaded. Wait for Explorer to exit naturally; no additional version will be loaded.");
         require(loaded.empty(),"Multiple TinyTaskbar DLL images are loaded; no additional image will be loaded.");
         wchar_t path[32768]={};DWORD n=GetModuleFileNameExW(explorer,module,path,32768);
         require(n && n<32768,"Cannot locate the already loaded TinyTaskbar DLL.");loaded.assign(path,n);
     }
-    require(loaded.empty(),"A TinyTaskbar DLL is already loaded in this Explorer. Re-initialization is disabled after the observed XAML crash; wait for Explorer to exit normally. No restart was requested.");
-    executable.resize(executable.find_last_of(L"\\/")+1);executable+=L"TinyTaskbarTap-v3.dll";
-    log("Using adjacent reviewed DLL: "+utf8(executable));return executable;
+    bool reconnect=!loaded.empty();
+    if(!reconnect){executable.resize(executable.find_last_of(L"\\/")+1);loaded=executable+L"TinyTaskbarTap-v4.dll";}
+    log(std::string(reconnect?"Reconnect to loaded broker DLL: ":"First initialization with adjacent DLL: ")+utf8(loaded));
+    return {loaded,reconnect};
 }
-struct Ipc {
-    OwnedHandle mapping,ready,command,applied,done;
-    State* state=nullptr;HANDLE explorer=nullptr;bool started=false,stopped=false;
-    ~Ipc() {
-        if(started && !stopped)try{stop();}catch(std::exception const& e){log(std::string("Cleanup not acknowledged: ")+e.what());}
-        if(state)UnmapViewOfFile(state);
-    }
-    void create(DWORD target,HWND bar,HANDLE process) {
-        explorer=process;
-        mapping.value=CreateFileMappingW(INVALID_HANDLE_VALUE,nullptr,PAGE_READWRITE,0,sizeof(State),objectName(target,L"state").c_str());
-        require(mapping.value && GetLastError()!=ERROR_ALREADY_EXISTS,"Another session is active or cleanup is retained; this session will not overwrite it.");
-        state=static_cast<State*>(MapViewOfFile(mapping.value,FILE_MAP_ALL_ACCESS,0,0,sizeof(State)));require(state!=nullptr,"Cannot map reviewed IPC.");
-        ZeroMemory(state,sizeof(State));state->magic=ProtocolMagic;state->version=ProtocolVersion;state->targetPid=target;
-        state->ownerPid=GetCurrentProcessId();state->taskbar=UINT_PTR(bar);state->maxLifetimeMs=0;
-        FILETIME c,e,k,u;require(GetProcessTimes(GetCurrentProcess(),&c,&e,&k,&u)!=FALSE,"Cannot record owner process birth.");state->ownerCreation=fileTicks(c);
-        auto event=[&](OwnedHandle& h,wchar_t const* suffix,BOOL manual){
-            h.value=CreateEventW(nullptr,manual,FALSE,objectName(target,suffix).c_str());
-            require(h.value && GetLastError()!=ERROR_ALREADY_EXISTS,"IPC event collision; no existing session will be changed.");
-        };
-        event(ready,L"ready",TRUE);event(command,L"command",FALSE);event(applied,L"applied",TRUE);event(done,L"done",TRUE);
-    }
-    void stop() {
-        if(!started || stopped)return;
-        if(WaitForSingleObject(explorer,0)==WAIT_OBJECT_0){stopped=true;log("Explorer exited; its old taskbar and DLL are gone. See Windows events for the exit cause.");return;}
-        InterlockedExchange(&state->command,CommandStop);SetEvent(command.value);HANDLE waits[]={done.value,explorer};
-        DWORD result=WaitForMultipleObjects(2,waits,FALSE,6000);
-        if(result==WAIT_OBJECT_0+1){stopped=true;log("Explorer exited during cleanup; no restart was requested.");return;}
-        char line[220]={};sprintf_s(line,"Stop result=%lu hr=%08lx backgrounds=%ld restored=%ld cleanupComplete=%ld cleanupRetained=%ld pending=%ld",result,DWORD(state->error),state->backgrounds,state->restored,state->cleanupComplete,state->cleanupRetained,state->restorePending);log(line);
-        require(result==WAIT_OBJECT_0 && state->cleanupComplete==1,"Restoration not acknowledged. Saved cleanup remains in Explorer; no automatic restart or unload.");
-        stopped=true;require(state->error==0 && state->restoredFills==state->fills && state->restoredStrokes==state->strokes,"Restoration acknowledged, but a callback error or per-element restore count mismatch was recorded.");
-        log("Background restored; manual controller exits; DLL remains pinned until Explorer naturally exits.");
-    }
-};
-struct Library {
-    HMODULE module=nullptr;HHOOK hook=nullptr;OwnedHandle thread;
-    ~Library(){if(hook)UnhookWindowsHookEx(hook);if(module)FreeLibrary(module);}
-};
-struct Runtime {
-    OwnedHandle explorer,instance;
-    Ipc ipc;Library library;
-    std::unique_ptr<TrustedDllFile> trusted;
-    DWORD target=0;HWND bar=nullptr;
-    void start(std::wstring const& executable) {
-        DWORD tid=validate(bar,explorer);target=GetProcessId(explorer.value);
-        instance.value=CreateMutexW(nullptr,FALSE,(L"Local\\TinyTaskbar.Manual.2cb3b83d-v3."+std::to_wstring(target)).c_str());
-        require(instance.value && GetLastError()!=ERROR_ALREADY_EXISTS,"TinyTaskbar is already running.");
-        require(!FindWindowW(L"TTB_WorkerWindow",nullptr),"TranslucentTB is running. Quit it normally before using TinyTaskbar.");
-        trusted=std::make_unique<TrustedDllFile>(selectDll(explorer.value,executable));
-        log("Reviewed v3 DLL SHA-256 verified; lease=0; owner death restores both fill and stroke.");
-        ipc.create(target,bar,explorer.value);
-        library.module=LoadLibraryExW(trusted->path.c_str(),nullptr,LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR|LOAD_LIBRARY_SEARCH_SYSTEM32);
-        require(library.module!=nullptr,"Cannot load the reviewed DLL locally.");
-        FARPROC raw=GetProcAddress(library.module,"TinyTaskbarHook");HOOKPROC hook=nullptr;
-        static_assert(sizeof(hook)==sizeof(raw),"pointer size");std::memcpy(&hook,&raw,sizeof(hook));require(hook!=nullptr,"Reviewed hook export is missing.");
-        DWORD pid=0;require(GetWindowThreadProcessId(bar,&pid)==tid && pid==target,"Explorer changed before initialization.");
-        library.thread.value=OpenThread(THREAD_QUERY_LIMITED_INFORMATION|SYNCHRONIZE,FALSE,tid);
-        require(library.thread.value && GetProcessIdOfThread(library.thread.value)==target && WaitForSingleObject(library.thread.value,0)==WAIT_TIMEOUT,"Taskbar UI thread changed before initialization.");
-        library.hook=SetWindowsHookExW(WH_CALLWNDPROC,hook,library.module,tid);require(library.hook!=nullptr,"Taskbar initialization hook failed.");ipc.started=true;
-        DWORD_PTR result=0;
-        require(SendMessageTimeoutW(bar,RegisterWindowMessageW(BeginMessage),0,0,SMTO_ABORTIFHUNG|SMTO_BLOCK,2000,&result)!=0,"Taskbar initialization message timed out.");
-        require(waitStartup(ipc.ready.value,20000),"Startup cancelled or XAML initialization did not acknowledge in 20 seconds.");
-        require(UnhookWindowsHookEx(library.hook)!=FALSE,"Temporary initialization hook could not be removed.");library.hook=nullptr;
-        pumpOwnMessages();
-        require(applyGate(*ipc.state,quitRequested)==ElementGate::Ready,"Startup cancelled, callback failed, or BackgroundFill/BackgroundStroke is missing; no apply command sent.");
-        char geometry[320]={};sprintf_s(geometry,"XAML Rectangle BackgroundStroke in Taskbar.TaskbarFrame: fills=%ld strokes=%ld DIP rect=%g,%g,%g,%g rasterScale=%g",ipc.state->fills,ipc.state->strokes,ipc.state->strokeX,ipc.state->strokeY,ipc.state->strokeWidth,ipc.state->strokeHeight,ipc.state->rasterScale);log(geometry);
-        ResetEvent(ipc.applied.value);InterlockedExchange(&ipc.state->command,CommandApply);SetEvent(ipc.command.value);
-        require(waitStartup(ipc.applied.value,5000) && applyGate(*ipc.state,quitRequested,true)==ElementGate::Ready,"Apply cancelled or live primary fill/stroke pair was not acknowledged.");
-        log("TRANSPARENT_READY: temporary hook removed, lease=0, event-driven idle. Quit or --stop restores.");
-    }
-};
+#include "controller_runtime.hpp"
 static NOTIFYICONDATAW trayData() {
     NOTIFYICONDATAW data={};data.cbSize=sizeof(data);data.hWnd=window;data.uID=1;
     data.uFlags=NIF_MESSAGE|NIF_ICON|NIF_TIP;data.uCallbackMessage=TrayMessage;
@@ -240,31 +162,30 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int) {
             }
         }
         require(argc==1,"Usage: TinyTaskbar.exe [--stop | --startup-enable | --startup-disable | --startup-remove | --startup-status].");
-        require(!FindWindowW(WindowClass,nullptr),"TinyTaskbar is already running.");
+        OwnedMutex controllerLock;claimMutex(controllerLock,L"Local\\TinyTaskbar.Controller.4eda63e0-v4");
         recreated=RegisterWindowMessageW(L"TaskbarCreated");require(recreated!=0,"Cannot register the taskbar notification.");
         WNDCLASSW type={};type.hInstance=instance;type.lpfnWndProc=windowProc;type.lpszClassName=WindowClass;
         require(RegisterClassW(&type)!=0,"Cannot register the controller window.");
         Window ownedWindow;window=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE,WindowClass,L"Taskbar transparency",WS_OVERLAPPED,0,0,0,0,nullptr,nullptr,instance,nullptr);
         require(window!=nullptr,"Cannot create the hidden controller window.");
-        Runtime runtime;runtime.start(executable);Tray tray;tray.add();
-        while(!quitRequested) {
-            HANDLE process=runtime.explorer.value;
-            DWORD result=MsgWaitForMultipleObjectsEx(1,&process,INFINITE,QS_ALLINPUT,MWMO_INPUTAVAILABLE);
-            require(result!=WAIT_FAILED,"Controller message wait failed.");
-            if(result==WAIT_OBJECT_0){log("Explorer exited; manual re-run required after restart.");break;}
-            MSG message={};while(PeekMessageW(&message,nullptr,0,0,PM_REMOVE)){
-                if(message.message==WM_QUIT){quitRequested=true;break;}
-                TranslateMessage(&message);DispatchMessageW(&message);
+        while(!quitRequested){
+            Runtime runtime;runtime.start(executable);Tray tray;tray.add();bool shellEnded=false;
+            while(!quitRequested){
+                HANDLE handles[]={runtime.explorer.value,runtime.ipc.changed.value};
+                DWORD result=MsgWaitForMultipleObjectsEx(2,handles,INFINITE,QS_ALLINPUT,MWMO_INPUTAVAILABLE);
+                require(result!=WAIT_FAILED,"Controller message wait failed.");
+                if(result==WAIT_OBJECT_0){shellEnded=true;log("Explorer ended naturally; waiting up to 30 seconds for a new taskbar.");break;}
+                pumpOwnMessages();
+                require(!readLong(runtime.ipc.state->error) && readLong(runtime.ipc.state->status)!=StatusPoisoned,"Broker failed; restoring and stopping this controller.");
+                if(taskbarRecreated){
+                    taskbarRecreated=false;DWORD pid=0;GetWindowThreadProcessId(FindWindowW(L"Shell_TrayWnd",nullptr),&pid);
+                    if(pid && pid!=runtime.target){log("Taskbar owner changed before old Explorer ended; stopping safely.");quitRequested=true;break;}
+                    tray.add();log("Same-Explorer taskbar recreated; broker retained, tray re-added.");
+                }
             }
-            if(taskbarRecreated) {
-                taskbarRecreated=false;DWORD pid=0;GetWindowThreadProcessId(FindWindowW(L"Shell_TrayWnd",nullptr),&pid);
-                if(pid!=runtime.target){log("Explorer/taskbar owner changed; manual re-run required.");break;}
-                // Existing v3 watcher handles Add/Remove within this Explorer.
-                // Restore our notification icon without another DLL load/hook.
-                tray.add();log("Same-Explorer taskbar recreated; existing watcher retained, tray re-added.");
-            }
+            runtime.ipc.stop();if(!shellEnded)break;
         }
-        runtime.ipc.stop();return 0;
+        return 0;
     }catch(std::exception const& e){log(std::string("ERROR: ")+e.what());return 1;}
     catch(...){log("ERROR: unexpected controller failure.");return 1;}
 }

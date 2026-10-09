@@ -20,8 +20,10 @@ Relevant upstream source:
 TinyTaskbar narrows these mechanisms to transparent background and border
 brushes. It adds a controller, owner lifetime checks, reversible restoration,
 separate brush tracking, startup acknowledgments, frozen-build identity checking,
-and opt-in current-user login startup. The earlier r1 Explorer crash's root
-cause remains unresolved; this is experimental source only with no binary release.
+opt-in current-user login startup, and a persistent broker for reconnect without
+reinitialization. The accepted v4 source passed one local basic observation;
+the earlier prototype crash's root cause remains unresolved. See
+[verification status](docs/TESTING.md) for the scope and limits.
 
 **C++/WinRT** headers from the installed Windows SDK are used to build the DLL.
 The build used header version 2.0.220110.5. They are copyright Microsoft

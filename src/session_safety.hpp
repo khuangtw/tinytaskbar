@@ -37,6 +37,13 @@ public:
         return changed.wait_for(lock,timeout,[&]{return active==0;});
     }
     bool drained(){std::lock_guard<std::mutex> lock(mutex);return closed && active==0;}
+    bool quiescent(){std::lock_guard<std::mutex> lock(mutex);return active==0;}
+    // Keep admission locked through the caller's state transition. A bool
+    // snapshot followed by a second lock allows a callback to enter the gap.
+    template<class Transition>bool whenQuiescent(Transition transition){
+        std::lock_guard<std::mutex> lock(mutex);
+        return active==0 && transition();
+    }
 };
 // The active ticket outlives exception reporting, not just the work body.
 // Rejected late callbacks still run their bounded housekeeping with admitted=false.

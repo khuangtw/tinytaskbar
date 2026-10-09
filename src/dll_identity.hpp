@@ -1,6 +1,6 @@
 // GPL-3.0. Identity check shared by the manual controller and offline tests.
 #pragma once
-#include "protocol.hpp"
+#include "win32_helpers.hpp"
 #include <bcrypt.h>
 #include <array>
 #include <vector>
@@ -8,14 +8,6 @@
 
 // Generated after building the DLL; a fork's controller must match its own DLL.
 #include "dll_build_identity.hpp"
-struct OwnedHandle {
-    HANDLE value=nullptr;
-    OwnedHandle()=default;
-    OwnedHandle(OwnedHandle const&)=delete;
-    OwnedHandle& operator=(OwnedHandle const&)=delete;
-    ~OwnedHandle(){if(value && value!=INVALID_HANDLE_VALUE)CloseHandle(value);}
-};
-inline void require(bool ok,char const* reason){if(!ok)throw std::runtime_error(reason);}
 struct TrustedDllFile {
     OwnedHandle file;
     std::wstring path;

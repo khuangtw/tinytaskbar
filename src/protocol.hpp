@@ -1,28 +1,41 @@
-// GPL-3.0-only; modified 2026-10-07/08. See ../LICENSE and ../THIRD_PARTY.md.
+// SPDX-License-Identifier: GPL-3.0-only
 #pragma once
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
 #include <string>
+#include "broker_build_identity.hpp"
 
-inline constexpr GUID TapClass = {0x2cb3b83d,0x3a46,0x45bf,{0xb3,0x46,0xc8,0x41,0x3c,0x77,0x92,0x23}};
-inline constexpr DWORD ProtocolMagic = 0x54425459, ProtocolVersion = 3;
-inline constexpr wchar_t BeginMessage[] = L"TinyTaskbar.Begin.2cb3b83d-3a46-45bf-b346-c8413c779223";
-enum : LONG { CommandNone=0, CommandApply=1, CommandStop=2 };
-enum : LONG { PrimaryFillLive=1,PrimaryStrokeLive=2,PrimaryPairLive=4,PrimaryPairApplied=8 };
+// Incompatible with v3. A loaded older/different image is refused before injection.
+inline constexpr GUID TapClass={0x4eda63e0,0x7e91,0x4ec0,{0x9f,0xc2,0xd4,0xcb,0x44,0x7e,0x04,0x01}};
+inline constexpr DWORD ProtocolMagic=0x54425459,ProtocolVersion=4;
+inline constexpr ULONGLONG BrokerBuild=0x202610080001ULL;
+inline constexpr wchar_t BeginMessage[]=L"TinyTaskbar.Begin.4eda63e0-7e91-4ec0-9fc2-d4cb447e0401";
+enum : LONG {CommandNone=0,CommandAttach=1,CommandApply=2,CommandStop=3};
+enum : LONG {StatusStarting=0,StatusIdle=1,StatusAttached=2,StatusRestoring=3,StatusPoisoned=4};
+enum : LONG {PrimaryFillLive=1,PrimaryStrokeLive=2,PrimaryPairLive=4,PrimaryPairApplied=8};
 struct State {
-    DWORD magic, version, targetPid, ownerPid;
-    ULONGLONG ownerCreation;
+    DWORD magic,version,bytes,targetPid;
+    ULONGLONG targetCreation,build;
+    unsigned char revision[32];
     UINT_PTR taskbar;
-    DWORD maxLifetimeMs; // Bounded probe uses 90000; normal manual-run mode may use 0 with owner-death restoration.
-    volatile LONG command, error, backgrounds, applied, restored, applyPending, restorePending, stopping;
-    volatile LONG cleanupComplete, cleanupRetained;
+    DWORD bootstrapPid,reserved;
+    ULONGLONG bootstrapCreation;
+    // Request publication is sequence-last (InterlockedExchange); one controller
+    // holds the per-Explorer client mutex. Broker never writes request payload.
+    DWORD requestPid,requestVersion;
+    ULONGLONG requestCreation;
+    unsigned char requestRevision[32];
+    volatile LONG command,requestSequence,responseSequence,responseError;
+    DWORD ownerPid,ownerReserved;
+    ULONGLONG ownerCreation,generation;
+    volatile LONG status,error,backgrounds,applied,restored,applyPending,restorePending;
+    volatile LONG cleanupComplete,cleanupRetained;
     volatile LONG fills,strokes,appliedFills,appliedStrokes,restoredFills,restoredStrokes;
-    volatile LONG primaryReadiness; // Uses the existing 4-byte padding; cumulative counts remain unchanged.
+    volatile LONG primaryReadiness,initializations;
     double strokeX,strokeY,strokeWidth,strokeHeight,rasterScale;
 };
-inline std::wstring objectName(DWORD pid,const wchar_t* suffix) {
-    return L"Local\\TinyTaskbar.2cb3b83d-v3."+std::to_wstring(pid)+L"."+suffix;
-}
-inline ULONGLONG fileTicks(FILETIME t) {return (ULONGLONG(t.dwHighDateTime)<<32)|t.dwLowDateTime;}
-inline void recordError(State* s,HRESULT hr) {if(s && FAILED(hr))InterlockedCompareExchange(&s->error,LONG(hr),0);}
+inline ULONGLONG fileTicks(FILETIME value){return (ULONGLONG(value.dwHighDateTime)<<32)|value.dwLowDateTime;}
+inline std::wstring objectName(DWORD pid,ULONGLONG birth,wchar_t const* suffix){return L"Local\\TinyTaskbar.4eda63e0-v4."+std::to_wstring(pid)+L"."+std::to_wstring(birth)+L"."+suffix;}
+inline LONG readLong(volatile LONG const& value){return InterlockedCompareExchange(const_cast<volatile LONG*>(&value),0,0);}
+inline void recordError(State* state,HRESULT hr){if(state && FAILED(hr))InterlockedCompareExchange(&state->error,LONG(hr),0);}

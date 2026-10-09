@@ -8,6 +8,10 @@
 *.dll
 *.log
 *.bmp
+*.png
+*.jpg
+*.jpeg
+*.zip
 *.dmp
 *.mdmp
 *.tmp

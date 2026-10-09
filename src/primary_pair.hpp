@@ -21,9 +21,18 @@ class PrimaryPair {
         InterlockedExchange(&state.primaryReadiness,flags);
     }
 public:
-    void add(State& state,ULONGLONG handle,UINT_PTR taskbar,UINT_PTR frame,bool stroke) {
-        if(taskbar!=state.taskbar || !frame)return;
+    void rebind(State& state,UINT_PTR taskbar) {
         std::lock_guard<std::mutex> lock(mutex);
+        if(state.taskbar!=taskbar){state.taskbar=taskbar;live.clear();publishLocked(state);}
+    }
+    void clearApplied(State& state) {
+        std::lock_guard<std::mutex> lock(mutex);
+        for(auto& item:live)item.applied=false;
+        publishLocked(state);
+    }
+    void add(State& state,ULONGLONG handle,UINT_PTR taskbar,UINT_PTR frame,bool stroke) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if(taskbar!=state.taskbar || !frame)return;
         if(std::none_of(live.begin(),live.end(),[&](auto const& e){return e.handle==handle;}))
             live.push_back({handle,frame,stroke});
         publishLocked(state);

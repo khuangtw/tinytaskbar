@@ -1,19 +1,13 @@
-// GPL-3.0. Small shared gates used by the real controller and offline checks.
+// SPDX-License-Identifier: GPL-3.0-only
 #pragma once
 #include "protocol.hpp"
-enum class ElementGate { Ready, Cancelled, CallbackFailure, MissingFill, MissingStroke, MissingPair, NotApplied };
-inline ElementGate applyGate(State const& state,bool quitRequested,bool requireApplied=false) {
-    if(quitRequested || state.stopping)return ElementGate::Cancelled;
-    if(state.error)return ElementGate::CallbackFailure;
-    LONG primary=state.primaryReadiness;
-    if(!(primary&PrimaryFillLive))return ElementGate::MissingFill;
-    if(!(primary&PrimaryStrokeLive))return ElementGate::MissingStroke;
-    if(!(primary&PrimaryPairLive))return ElementGate::MissingPair;
-    if(requireApplied && !(primary&PrimaryPairApplied))return ElementGate::NotApplied;
-    return ElementGate::Ready;
-}
-enum class DllGate { Unrelated, Current, OlderOrOtherVersion };
-inline DllGate classifyDll(wchar_t const* name) {
-    if(_wcsnicmp(name,L"TinyTaskbarTap-",15))return DllGate::Unrelated;
-    return _wcsicmp(name,L"TinyTaskbarTap-v3.dll")?DllGate::OlderOrOtherVersion:DllGate::Current;
+#include <cstring>
+inline bool compatibleState(State const& state,DWORD pid,ULONGLONG birth){return state.magic==ProtocolMagic && state.version==ProtocolVersion && state.bytes==sizeof(State) && state.build==BrokerBuild && std::memcmp(state.revision,BrokerRevision,32)==0 && state.targetPid==pid && state.targetCreation==birth;}
+inline bool compatibleRequest(State const& state){return state.requestVersion==ProtocolVersion && std::memcmp(state.requestRevision,BrokerRevision,32)==0;}
+inline bool primaryReady(State const& state,bool applied=false){LONG flags=readLong(state.primaryReadiness);constexpr LONG live=PrimaryFillLive|PrimaryStrokeLive|PrimaryPairLive;return !readLong(state.error) && (flags&live)==live && (!applied || (flags&PrimaryPairApplied));}
+enum class DllGate {Unrelated,Current,OlderOrOtherVersion};
+inline DllGate classifyDll(wchar_t const* name){
+    if(_wcsicmp(name,L"ExplorerTAP.dll")==0)return DllGate::OlderOrOtherVersion;
+    if(_wcsnicmp(name,L"TinyTaskbarTap",14))return DllGate::Unrelated;
+    return _wcsicmp(name,L"TinyTaskbarTap-v4.dll")?DllGate::OlderOrOtherVersion:DllGate::Current;
 }
